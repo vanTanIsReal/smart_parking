@@ -13,6 +13,8 @@ import time
 import csv
 from datetime import datetime
 import threading
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List
 
 # === Cấu hình Logging ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,6 +35,13 @@ ONE_LINE_RATIO_THRESHOLD = 2.5  # Ngưỡng tỷ số w/h để xác định bi�
 CSV_FILE = 'plate_recognition.csv'
 CSV_WRITE_INTERVAL = 3  # giây
 
+# Smart parking config
+DEFAULT_EXIT_SOURCE_RAW = os.environ.get("EXIT_CAMERA_SOURCE", os.environ.get("EXIT_CAMERA_URL", "1"))
+DEFAULT_ENTRY_INDEX = int(os.environ.get("ENTRY_CAMERA_INDEX", "0"))
+FORCE_GPU = os.environ.get("FORCE_GPU", "1").strip().lower() not in ("0", "false", "no")
+PROCESS_EVERY_N_FRAMES = int(os.environ.get("PROCESS_EVERY_N_FRAMES", "2"))
+DEDUP_SECONDS = float(os.environ.get("DEDUP_SECONDS", "4.0"))
+
 # Tạo các thư mục cần thiết
 for folder in [UPLOAD_FOLDER, RESULT_FOLDER, CHECK_FOLDER, MODEL_DIR]:
     os.makedirs(folder, exist_ok=True)
@@ -51,6 +60,15 @@ try:
 except Exception as e:
     logger.error(f"Lỗi khi tải mô hình YOLO: {str(e)}")
     raise
+
+CUDA_AVAILABLE = torch.cuda.is_available()
+DEVICE_STR = "cuda:0" if CUDA_AVAILABLE else "cpu"
+if FORCE_GPU and not CUDA_AVAILABLE:
+    raise RuntimeError(
+        "FORCE_GPU=1 nhưng không phát hiện CUDA. "
+        "Hãy cài đúng PyTorch CUDA + driver NVIDIA, hoặc set FORCE_GPU=0 để chạy CPU."
+    )
+logger.info(f"Device inference: {DEVICE_STR} (cuda_available={CUDA_AVAILABLE})")
 
 # Tải mô hình TrOCR với bộ nhớ đệm
 @torch.no_grad()
@@ -71,8 +89,8 @@ def load_trocr_model():
         
         # Đặt mô hình ở chế độ đánh giá và chuyển sang GPU nếu có
         trocr_model.eval()
-        if torch.cuda.is_available():
-            trocr_model = trocr_model.to("cuda")
+        if CUDA_AVAILABLE:
+            trocr_model = trocr_model.to(DEVICE_STR)
             logger.info("Mô hình TrOCR được tải trên GPU")
         else:
             logger.info("Mô hình TrOCR được tải trên CPU")
@@ -83,11 +101,15 @@ def load_trocr_model():
 
 processor, trocr_model = load_trocr_model()
 
-# === Biến toàn cục để điều khiển camera ===
-camera = None
-camera_running = False
-camera_lock = threading.Lock()
-last_csv_write = 0
+# === Smart parking state ===
+config_lock = threading.Lock()
+exit_camera_source = DEFAULT_EXIT_SOURCE_RAW
+
+parking_lock = threading.Lock()
+parking_inside: Dict[str, float] = {}  # plate -> last_seen timestamp
+
+events_lock = threading.Lock()
+recent_events: List[Dict[str, Any]] = []  # newest first
 
 # === Hàm trợ giúp ===
 def deskew_image(image):
@@ -129,8 +151,8 @@ def ocr_with_trocr_batch(images, max_batch_size=8):
             pixel_values = inputs.pixel_values
             
             # Chuyển sang GPU nếu có
-            if torch.cuda.is_available():
-                pixel_values = pixel_values.to("cuda")
+            if CUDA_AVAILABLE:
+                pixel_values = pixel_values.to(DEVICE_STR)
             
             # Tạo văn bản
             generated_ids = trocr_model.generate(
@@ -148,6 +170,24 @@ def ocr_with_trocr_batch(images, max_batch_size=8):
     except Exception as e:
         logger.error(f"Lỗi OCR hàng loạt: {str(e)}")
         return ["Không nhận dạng" for _ in images]
+
+
+def warmup_models():
+    """Warmup YOLO/TrOCR để giảm giật khung hình khi vừa start."""
+    try:
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        _ = model(dummy, conf=0.35, device=0 if CUDA_AVAILABLE else "cpu", verbose=False)
+    except Exception as e:
+        logger.warning(f"Warmup YOLO lỗi: {e}")
+
+    try:
+        dummy2 = np.zeros((64, 256, 3), dtype=np.uint8)
+        _ = ocr_with_trocr_batch([dummy2])
+    except Exception as e:
+        logger.warning(f"Warmup TrOCR lỗi: {e}")
+
+
+warmup_models()
 
 def split_plate_two_lines(plate_img):
     """Tách biển số hai dòng thành hai ảnh riêng biệt"""
@@ -267,7 +307,7 @@ def write_to_csv(plates):
 # === Hàm xử lý video ===
 def extract_plates_from_frame(frame):
     """Trích xuất biển số từ một khung hình video"""
-    results = model(frame, conf=0.35)
+    results = model(frame, conf=0.35, device=0 if CUDA_AVAILABLE else "cpu", verbose=False)
     plates_data = []
     
     for result in results:
@@ -320,56 +360,197 @@ def draw_results_on_frame(frame, plates):
     
     return frame
 
-def generate_frames():
-    """Tạo các khung hình video với phát hiện biển số"""
-    global camera, camera_running, last_csv_write
-    
-    if camera is None or not camera.isOpened():
-        logger.error("Camera không khả dụng hoặc chưa được khởi tạo")
-        return
-    
-    camera_running = True
-    last_csv_write = time.time()
-    frame_skip = 0  # Xử lý mỗi khung hình thứ N
-    
-    while camera_running:
-        with camera_lock:
-            success, frame = camera.read()
-            
-        if not success:
-            logger.error("Không thể đọc khung hình từ camera")
-            time.sleep(0.1)
-            continue
-        
-        # Chỉ xử lý mỗi khung hình thứ N để giảm tải CPU
-        frame_skip = (frame_skip + 1) % 2
-        if frame_skip == 0:
-            # Trích xuất biển số
-            plates_data = extract_plates_from_frame(frame)
-            
-            # Xử lý biển số
-            plates = process_plates_batch(plates_data)
-            
-            # Vẽ kết quả trên khung hình
-            frame = draw_results_on_frame(frame, plates)
-            
-            # Ghi vào CSV định kỳ
-            current_time = time.time()
-            if plates and current_time - last_csv_write >= CSV_WRITE_INTERVAL:
-                write_to_csv(plates)
-                last_csv_write = current_time
-        
-        # Chuyển đổi khung hình sang JPEG
-        ret, buffer = cv2.imencode('.jpg', frame)
-        frame_bytes = buffer.tobytes()
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+def _now() -> float:
+    return time.time()
+
+
+def _push_event(event: Dict[str, Any]) -> None:
+    with events_lock:
+        recent_events.insert(0, event)
+        del recent_events[0:200]  # giữ tối đa 200 event
+
+
+def _normalize_plate(text: str) -> str:
+    return "".join(ch for ch in (text or "").upper().strip() if ch.isalnum())
+
+
+def _parse_camera_source(value: Any) -> Any:
+    """Cho phép source là int index (webcam) hoặc URL."""
+    if isinstance(value, int):
+        return value
+    s = str(value).strip()
+    if s.isdigit():
+        return int(s)
+    return s
+
+
+@dataclass
+class CameraPipeline:
+    name: str  # "entry" | "exit"
+    source: Any  # int index or url
+    running: bool = False
+    cap: Optional[cv2.VideoCapture] = None
+    thread: Optional[threading.Thread] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    frame_jpeg: Optional[bytes] = None
+    last_plates: List[Dict[str, Any]] = None
+    last_error: Optional[str] = None
+    last_seen_plate_ts: Dict[str, float] = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.last_plates = []
+        self.last_seen_plate_ts = {}
+        self.last_error = None
+
+        parsed_source = _parse_camera_source(self.source)
+        self.cap = cv2.VideoCapture(parsed_source)
+        self.source = parsed_source
+
+        # Nếu source là URL và không mở được, thử fallback DroidCam virtual webcam indices
+        if (not self.cap or not self.cap.isOpened()) and isinstance(parsed_source, str):
+            for fallback_idx in (1, 2, 3, 4):
+                cap_try = cv2.VideoCapture(fallback_idx)
+                if cap_try and cap_try.isOpened():
+                    logger.warning(
+                        f"{self.name}: URL camera không mở được ({parsed_source}), "
+                        f"fallback sang camera index {fallback_idx}"
+                    )
+                    self.cap = cap_try
+                    self.source = fallback_idx
+                    break
+                if cap_try:
+                    cap_try.release()
+
+        if not self.cap or not self.cap.isOpened():
+            self.running = False
+            self.last_error = (
+                f"Không thể mở camera nguồn={parsed_source}. "
+                "Nếu dùng DroidCam Client, nhập source là 1 hoặc 2 thay vì URL."
+            )
+            raise RuntimeError(self.last_error)
+
+        # giảm lag
+        try:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 20)
+        except Exception:
+            pass
+
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        finally:
+            self.cap = None
+            self.thread = None
+
+    def _loop(self):
+        frame_skip = 0
+        last_csv_write = _now()
+
+        while self.running:
+            cap = self.cap
+            if cap is None:
+                time.sleep(0.05)
+                continue
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                self.last_error = "Không thể đọc frame"
+                time.sleep(0.1)
+                continue
+
+            frame_skip = (frame_skip + 1) % max(1, PROCESS_EVERY_N_FRAMES)
+            plates: List[Dict[str, Any]] = []
+            if frame_skip == 0:
+                try:
+                    plates_data = extract_plates_from_frame(frame)
+                    plates = process_plates_batch(plates_data)
+                    frame = draw_results_on_frame(frame, plates)
+
+                    if plates and _now() - last_csv_write >= CSV_WRITE_INTERVAL:
+                        write_to_csv(plates)
+                        last_csv_write = _now()
+
+                    self._smart_parking_update(plates)
+                    self.last_error = None
+                except Exception as e:
+                    self.last_error = str(e)
+
+            # encode cho stream (luôn encode để UI mượt)
+            try:
+                ret, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ret:
+                    with self.lock:
+                        self.frame_jpeg = buffer.tobytes()
+                        if plates:
+                            self.last_plates = plates
+            except Exception as e:
+                self.last_error = str(e)
+
+        # cleanup
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
+
+    def _smart_parking_update(self, plates: List[Dict[str, Any]]):
+        # dedup theo plate và thời gian để tránh spam
+        now = _now()
+        for p in plates:
+            plate_raw = _normalize_plate(p.get("text", ""))
+            if not plate_raw or plate_raw == _normalize_plate("Không nhận dạng"):
+                continue
+
+            last_ts = self.last_seen_plate_ts.get(plate_raw, 0.0)
+            if now - last_ts < DEDUP_SECONDS:
+                continue
+            self.last_seen_plate_ts[plate_raw] = now
+
+            if self.name == "entry":
+                with parking_lock:
+                    parking_inside[plate_raw] = now
+                _push_event({"ts": now, "type": "IN", "plate": plate_raw, "camera": "entry"})
+            elif self.name == "exit":
+                removed = False
+                with parking_lock:
+                    if plate_raw in parking_inside:
+                        parking_inside.pop(plate_raw, None)
+                        removed = True
+                _push_event({"ts": now, "type": "OUT" if removed else "OUT_UNK", "plate": plate_raw, "camera": "exit"})
+
+    def mjpeg_stream(self):
+        while True:
+            if not self.running:
+                time.sleep(0.1)
+                continue
+            with self.lock:
+                frame = self.frame_jpeg
+            if not frame:
+                time.sleep(0.05)
+                continue
+            yield (b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            time.sleep(0.03)  # ~30fps output (encode loop quyết định tốc độ thực)
+
+
+entry_pipeline = CameraPipeline(name="entry", source=DEFAULT_ENTRY_INDEX)
+exit_pipeline = CameraPipeline(name="exit", source=_parse_camera_source(DEFAULT_EXIT_SOURCE_RAW))
 
 # === Các tuyến Flask ===
 @app.route('/')
 def home():
-    return render_template('index.html')
+    with config_lock:
+        source = exit_camera_source
+    return render_template('index.html', exit_camera_source=source, force_gpu=FORCE_GPU, device=DEVICE_STR)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -432,40 +613,93 @@ def upload_file():
         logger.error(f"Lỗi xử lý: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/start_camera')
-def start_camera():
-    global camera, camera_running
-    
-    with camera_lock:
-        if camera is None or not camera.isOpened():
-            camera = cv2.VideoCapture(0)
-            if not camera.isOpened():
-                return jsonify({'error': 'Không thể mở camera'}), 500
-                
-            # Thiết lập thuộc tính camera để cải thiện hiệu suất
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            camera.set(cv2.CAP_PROP_FPS, 15)
-            
-        camera_running = True
-        
-    return jsonify({'status': 'Camera đã khởi động'})
+@app.route('/api/config', methods=['GET', 'POST'])
+def api_config():
+    global exit_camera_source
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        raw_source = str(data.get("exit_camera_source", data.get("exit_camera_url", ""))).strip()
+        if not raw_source:
+            return jsonify({"error": "exit_camera_source trống"}), 400
 
-@app.route('/stop_camera')
-def stop_camera():
-    global camera, camera_running
-    
-    with camera_lock:
-        camera_running = False
-        if camera is None:
-            camera.release()
-            camera = None
-            
-    return jsonify({'status': 'Camera đã dừng'})
+        with config_lock:
+            exit_camera_source = raw_source
+            exit_pipeline.source = _parse_camera_source(raw_source)
+        return jsonify({"status": "ok", "exit_camera_source": raw_source})
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    with config_lock:
+        source = exit_camera_source
+    return jsonify({"exit_camera_source": source, "force_gpu": FORCE_GPU, "device": DEVICE_STR})
+
+
+@app.route('/api/start', methods=['POST'])
+def api_start():
+    data = request.get_json(silent=True) or {}
+    which = (data.get("which") or "").strip().lower()
+    if which not in ("entry", "exit", "both"):
+        return jsonify({"error": "which phải là entry|exit|both"}), 400
+
+    try:
+        if which in ("entry", "both"):
+            entry_pipeline.start()
+        if which in ("exit", "both"):
+            with config_lock:
+                source = exit_camera_source
+            exit_pipeline.source = _parse_camera_source(source)
+            exit_pipeline.start()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/stop', methods=['POST'])
+def api_stop():
+    data = request.get_json(silent=True) or {}
+    which = (data.get("which") or "").strip().lower()
+    if which not in ("entry", "exit", "both"):
+        return jsonify({"error": "which phải là entry|exit|both"}), 400
+
+    if which in ("entry", "both"):
+        entry_pipeline.stop()
+    if which in ("exit", "both"):
+        exit_pipeline.stop()
+    return jsonify({"status": "ok"})
+
+
+@app.route('/stream/entry')
+def stream_entry():
+    return Response(entry_pipeline.mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/stream/exit')
+def stream_exit():
+    return Response(exit_pipeline.mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/api/status')
+def api_status():
+    with events_lock:
+        events = list(recent_events[:50])
+    with parking_lock:
+        inside = sorted(list(parking_inside.keys()))
+
+    def _fmt(ev):
+        return {
+            **ev,
+            "ts": datetime.fromtimestamp(ev["ts"]).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    return jsonify(
+        {
+            "device": DEVICE_STR,
+            "force_gpu": FORCE_GPU,
+            "entry": {"running": entry_pipeline.running, "error": entry_pipeline.last_error},
+            "exit": {"running": exit_pipeline.running, "error": exit_pipeline.last_error},
+            "inside": inside,
+            "inside_count": len(inside),
+            "events": [_fmt(e) for e in events],
+        }
+    )
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)

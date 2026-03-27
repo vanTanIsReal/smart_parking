@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hệ thống nhận diện biển số xe</title>
+    <title>Smart Parking</title>
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -88,13 +88,15 @@
         .image-box img, .image-box video {
             max-width: 100%;
             border-radius: 0.5rem;
-            display: none;
+            display: block;
             transition: opacity 0.5s ease;
         }
 
-        .image-box img.visible, .image-box video.visible {
-            display: block;
-            opacity: 1;
+        .image-box img {
+            width: 100%;
+            height: 360px;
+            object-fit: cover;
+            background: #0b1220;
         }
 
         .result-container {
@@ -205,220 +207,143 @@
 <body>
     <div class="container">
         <header>
-            <h1>HỆ THỐNG NHẬN DIỆN BIỂN SỐ XE</h1>
-            <p class="text-gray-600">Ứng dụng sử dụng YOLO và TrOCR để nhận diện biển số tự động</p>
+            <h1>SMART PARKING</h1>
+            <p class="text-gray-600">
+                2 camera (Vào = webcam, Ra = DroidCam). Device: <span class="font-semibold">{{ device }}</span>
+                {% if force_gpu %}<span class="text-green-700 font-semibold">(FORCE_GPU)</span>{% endif %}
+            </p>
         </header>
 
         <div class="upload-section">
-            <div class="button-group">
-                <label for="fileInput" class="btn btn-secondary">
-                    <i class="fas fa-camera"></i> Chọn ảnh biển số
-                </label>
-                <input type="file" id="fileInput" accept="image/*">
-                <button id="processBtn" class="btn btn-primary" onclick="debouncedProcessImage()">
-                    <i class="fas fa-cog"></i> Xử lý ảnh
-                </button>
-                <button id="startCameraBtn" class="btn btn-primary" onclick="startCamera()">
-                    <i class="fas fa-video"></i> Bật camera
-                </button>
-                <button id="stopCameraBtn" class="btn btn-danger" onclick="stopCamera()" style="display: none;">
-                    <i class="fas fa-stop"></i> Tắt camera
-                </button>
-            </div>
-
-            <div id="loading" class="loading">
-                <div class="spinner"></div>
-                <p class="text-gray-600">Đang xử lý, vui lòng chờ...</p>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+                <div class="text-left">
+                    <label class="block text-sm font-semibold text-gray-700 mb-1">Camera ra (URL hoặc index)</label>
+                    <input id="exitSource" class="w-full px-3 py-2 border rounded" value="{{ exit_camera_source }}" />
+                    <p class="text-xs text-gray-500 mt-1">Ví dụ URL: http://192.168.10.246:4747/video | DroidCam Client: nhập 1 hoặc 2</p>
+                </div>
+                <div class="button-group">
+                    <button class="btn btn-secondary" onclick="saveConfig()">
+                        <i class="fas fa-save"></i> Lưu cấu hình
+                    </button>
+                    <button class="btn btn-primary" onclick="startBoth()">
+                        <i class="fas fa-play"></i> Bật 2 camera
+                    </button>
+                    <button class="btn btn-danger" onclick="stopBoth()">
+                        <i class="fas fa-stop"></i> Tắt 2 camera
+                    </button>
+                </div>
+                <div class="text-left">
+                    <div class="text-sm font-semibold text-gray-700">Trạng thái bãi</div>
+                    <div class="text-2xl font-bold"><span id="insideCount">0</span> xe</div>
+                    <div id="statusLine" class="text-xs text-gray-600 mt-1">—</div>
+                </div>
             </div>
         </div>
 
         <div class="image-container">
             <div class="image-box">
-                <h2 class="text-xl font-semibold text-gray-800">Nguồn vào</h2>
-                <img id="originalImage" alt="Ảnh gốc">
-                <img id="cameraFeed" alt="Camera feed">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-xl font-semibold text-gray-800">Camera VÀO (Webcam)</h2>
+                    <span id="entryState" class="text-sm text-gray-600">—</span>
+                </div>
+                <img id="entryFeed" alt="Entry camera feed" src="/stream/entry" />
             </div>
             <div class="image-box">
-                <h2 class="text-xl font-semibold text-gray-800">Kết quả nhận diện</h2>
-                <img id="resultImage" alt="Kết quả">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-xl font-semibold text-gray-800">Camera RA (DroidCam)</h2>
+                    <span id="exitState" class="text-sm text-gray-600">—</span>
+                </div>
+                <img id="exitFeed" alt="Exit camera feed" src="/stream/exit" />
+            </div>
+            <div class="image-box">
+                <h2 class="text-xl font-semibold text-gray-800 mb-2">Trong bãi</h2>
+                <div id="insideList" class="text-sm text-gray-700 space-y-1"></div>
             </div>
         </div>
 
         <div class="result-container">
-            <h2 class="text-xl font-semibold text-gray-800">Thông tin biển số</h2>
-            <div id="plateInfo">
-                <p class="text-gray-600">Kết quả sẽ hiển thị tại đây sau khi xử lý...</p>
+            <div class="flex items-center justify-between">
+                <h2 class="text-xl font-semibold text-gray-800">Log vào/ra (mới nhất)</h2>
+                <button class="btn btn-secondary" onclick="refreshStatus()">
+                    <i class="fas fa-rotate"></i> Refresh
+                </button>
             </div>
+            <div id="events" class="mt-4 space-y-2"></div>
         </div>
     </div>
 
     <script>
-        // Hàm debounce
-        function debounce(func, wait) {
-            let timeout;
-            return function executedFunction(...args) {
-                const later = () => {
-                    clearTimeout(timeout);
-                    func(...args);
-                };
-                clearTimeout(timeout);
-                timeout = setTimeout(later, wait);
-            };
-        }
-
-        // Hiển thị ảnh xem trước khi chọn file
-        document.getElementById('fileInput').addEventListener('change', function(e) {
-            const file = e.target.files[0];
-            if (!file) return;
-
-            const reader = new FileReader();
-            reader.onload = function(event) {
-                const img = document.getElementById('originalImage');
-                img.src = event.target.result;
-                img.classList.add('visible');
-                document.getElementById('cameraFeed').classList.remove('visible');
-                
-                // Reset kết quả cũ
-                const resultImg = document.getElementById('resultImage');
-                resultImg.classList.remove('visible');
-                document.getElementById('plateInfo').innerHTML = '<p class="text-gray-600">Kết quả sẽ hiển thị tại đây sau khi xử lý...</p>';
-            };
-            reader.readAsDataURL(file);
-        });
-
-        // Hàm xử lý ảnh với debounce
-        const debouncedProcessImage = debounce(async function processImage() {
-            const fileInput = document.getElementById('fileInput');
-            const file = fileInput.files[0];
-            const plateInfo = document.getElementById('plateInfo');
-            const loading = document.getElementById('loading');
-
-            if (!file) {
-                showError('Vui lòng chọn ảnh trước khi xử lý');
-                return;
-            }
-
-            loading.style.display = 'block';
-            plateInfo.innerHTML = '';
-
-            const formData = new FormData();
-            formData.append('file', file);
-
-            try {
-                const response = await fetch('/upload', {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Lỗi HTTP! trạng thái: ${response.status}`);
-                }
-
-                const data = await response.json();
-
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-
-                const resultImg = document.getElementById('resultImage');
-                resultImg.src = data.result_image;
-                resultImg.classList.add('visible');
-
-                displayResults(data);
-
-            } catch (error) {
-                console.error('Lỗi:', error);
-                showError('Có lỗi xảy ra: ' + error.message);
-            } finally {
-                loading.style.display = 'none';
-            }
-        }, 500);
-
-        async function startCamera() {
-            try {
-                const response = await fetch('/start_camera');
-                const data = await response.json();
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-
-                const cameraFeed = document.getElementById('cameraFeed');
-                cameraFeed.src = "/video_feed?" + new Date().getTime();
-                cameraFeed.onerror = () => {
-                    showError("Không thể tải stream video từ camera. Vui lòng kiểm tra kết nối camera.");
-                };
-                cameraFeed.onload = () => {
-                    cameraFeed.classList.add('visible');
-                    document.getElementById('originalImage').classList.remove('visible');
-                    document.getElementById('resultImage').classList.remove('visible');
-                    document.getElementById('startCameraBtn').style.display = 'none';
-                    document.getElementById('stopCameraBtn').style.display = 'inline-flex';
-                    document.getElementById('plateInfo').innerHTML = '<p class="text-gray-600">Đang nhận diện từ camera...</p>';
-                };
-            } catch (error) {
-                console.error('Lỗi:', error);
-                showError('Không thể khởi động camera: ' + error.message);
-            }
-        }
-
-        async function stopCamera() {
-            try {
-                const response = await fetch('/stop_camera');
-                const data = await response.json();
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-
-                const cameraFeed = document.getElementById('cameraFeed');
-                cameraFeed.classList.remove('visible');
-                document.getElementById('startCameraBtn').style.display = 'inline-flex';
-                document.getElementById('stopCameraBtn').style.display = 'none';
-                document.getElementById('plateInfo').innerHTML = '<p class="text-gray-600">Camera đã dừng. Kết quả được lưu trong plate_recognition.csv</p>';
-            } catch (error) {
-                console.error('Lỗi:', error);
-                showError('Không thể dừng camera: ' + error.message);
-            }
-        }
-
-        function displayResults(data) {
-            const plateInfo = document.getElementById('plateInfo');
-
-            if (!data.plates || data.plates.length === 0) {
-                plateInfo.innerHTML = '<div class="error-message">Không phát hiện biển số trong ảnh</div>';
-                return;
-            }
-
-            let html = '';
-            data.plates.forEach((plate, index) => {
-                const confidencePercent = Math.round(plate.confidence * 100);
-
-                html += `
-                    <div class="plate-result">
-                        <h3 class="text-lg font-semibold text-gray-800">Biển số ${index + 1}</h3>
-                        <p><strong>Kết quả:</strong> ${plate.text || 'Không nhận dạng được'}</p>
-                        <p><strong>Độ tin cậy:</strong> ${confidencePercent}%</p>
-                        <div class="confidence-bar">
-                            <div class="confidence-level" style="width: ${confidencePercent}%"></div>
-                        </div>
-                        ${plate.coordinates ? `<p><strong>Vị trí:</strong> [${plate.coordinates.join(', ')}]</p>` : ''}
-                        ${plate.processed_images.length ? plate.processed_images.map(img => `<img src="${img}" alt="Biển số đã xử lý" class="mt-2 max-w-full rounded"/>`).join('') : ''}
-                    </div>
-                `;
+        async function saveConfig() {
+            const source = document.getElementById('exitSource').value.trim();
+            const res = await fetch('/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({exit_camera_source: source})
             });
-
-            plateInfo.innerHTML = html;
-
-            setTimeout(() => {
-                document.querySelectorAll('.confidence-level').forEach(bar => {
-                    bar.style.width = bar.parentElement.previousSibling.textContent.match(/\d+/)?.[0] + '%';
-                });
-            }, 100);
+            const data = await res.json();
+            if (!res.ok) alert(data.error || 'Lỗi lưu cấu hình');
+            refreshStatus();
         }
 
-        function showError(message) {
-            const plateInfo = document.getElementById('plateInfo');
-            plateInfo.innerHTML = `<div class="error-message">${message}</div>`;
+        async function startBoth() {
+            const res = await fetch('/api/start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({which: 'both'})
+            });
+            const data = await res.json();
+            if (!res.ok) alert(data.error || 'Không thể start');
+            refreshStatus();
+            // reload stream URLs để chống cache
+            document.getElementById('entryFeed').src = "/stream/entry?" + Date.now();
+            document.getElementById('exitFeed').src = "/stream/exit?" + Date.now();
         }
+
+        async function stopBoth() {
+            const res = await fetch('/api/stop', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({which: 'both'})
+            });
+            const data = await res.json();
+            if (!res.ok) alert(data.error || 'Không thể stop');
+            refreshStatus();
+        }
+
+        function badge(ok) {
+            return ok ? `<span class="text-green-700 font-semibold">RUNNING</span>` : `<span class="text-red-700 font-semibold">STOPPED</span>`;
+        }
+
+        async function refreshStatus() {
+            const res = await fetch('/api/status');
+            const s = await res.json();
+
+            document.getElementById('insideCount').textContent = s.inside_count;
+            document.getElementById('entryState').innerHTML = badge(s.entry.running) + (s.entry.error ? ` <span class="text-xs text-red-600">(${s.entry.error})</span>` : '');
+            document.getElementById('exitState').innerHTML = badge(s.exit.running) + (s.exit.error ? ` <span class="text-xs text-red-600">(${s.exit.error})</span>` : '');
+            document.getElementById('statusLine').textContent = `Device=${s.device}, FORCE_GPU=${s.force_gpu}`;
+
+            const inside = document.getElementById('insideList');
+            inside.innerHTML = s.inside.length ? s.inside.map(p => `<div class="px-2 py-1 bg-gray-100 rounded">${p}</div>`).join('') : `<div class="text-gray-500">Chưa có xe</div>`;
+
+            const ev = document.getElementById('events');
+            if (!s.events.length) {
+                ev.innerHTML = `<div class="text-gray-500">Chưa có log</div>`;
+                return;
+            }
+            ev.innerHTML = s.events.map(e => `
+                <div class="p-3 bg-gray-50 rounded border flex items-center justify-between">
+                    <div>
+                        <div class="font-semibold">${e.type} — ${e.plate}</div>
+                        <div class="text-xs text-gray-500">${e.ts} | camera=${e.camera}</div>
+                    </div>
+                    <div class="text-xs ${e.type.startsWith('IN') ? 'text-green-700' : 'text-blue-700'} font-semibold">${e.type}</div>
+                </div>
+            `).join('');
+        }
+
+        refreshStatus();
+        setInterval(refreshStatus, 1500);
     </script>
 </body>
 </html>

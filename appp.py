@@ -367,7 +367,7 @@ def _now() -> float:
 def _push_event(event: Dict[str, Any]) -> None:
     with events_lock:
         recent_events.insert(0, event)
-        del recent_events[0:200]  # giữ tối đa 200 event
+        del recent_events[200:]  # giữ tối đa 200 event mới nhất
 
 
 def _normalize_plate(text: str) -> str:

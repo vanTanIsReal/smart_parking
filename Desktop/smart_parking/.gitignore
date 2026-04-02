@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*$py.class
+plate_recognition.csv
+static/check/processed/
+models/trocr/model/model.safetensors

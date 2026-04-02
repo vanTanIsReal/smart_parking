@@ -1,0 +1,8 @@
+flask
+opencv-python
+numpy
+werkzeug
+ultralytics
+Pillow
+transformers
+torch
